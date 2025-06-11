@@ -1,0 +1,185 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <cpss/common/init/cpssInit.h>
+#include <cpss/common/port/cpssPortCtrl.h>
+#include <cpss/generic/cpssCommonDefs.h>
+#include <cpss/dxCh/dxChxGen/vlan/cpssDxChBrgVlan.h>
+#include <cpss/dxCh/dxChxGen/bridge/cpssDxChBrgGen.h>
+#include <cpss/dxCh/dxChxGen/bridge/cpssDxChBrgFdb.h>
+#include <cpss/dxCh/dxChxGen/bridge/cpssDxChBrgMc.h>
+#include <cpss/dxCh/dxChxGen/networkIf/cpssDxChNetIf.h>
+#include <cpss/dxCh/dxChxGen/cpssDxChTypes.h>
+
+#define DEV_NUM 0
+#define VLAN_ID 100
+#define TX_PORT 1
+
+static GT_U8 igmpQueryPacket[] = {
+    0x01, 0x00, 0x5E, 0x00, 0x00, 0x01,
+    0x00, 0xe0, 0xfc, 0x00, 0x00, 0x01,
+    0x08, 0x00,
+    0x46, 0x00, 0x00, 0x20, 0x00, 0x01, 0x00, 0x00,
+    0x01, 0x02, 0x00, 0x00,
+    0xc0, 0xa8, 0x01, 0x01,
+    0xe0, 0x00, 0x00, 0x01,
+    0x11, 0x64, 0x00, 0x00,
+    0xe0, 0x00, 0x00, 0x01
+};
+
+void createVlanWithPorts()
+{
+    CPSS_PORTS_BMP_STC portMembers, tagMembers;
+    cpssOsMemSet(&portMembers, 0, sizeof(portMembers));
+    cpssOsMemSet(&tagMembers, 0, sizeof(tagMembers));
+
+    CPSS_PORTS_BMP_PORT_SET_MAC(&portMembers, 1);
+    CPSS_PORTS_BMP_PORT_SET_MAC(&portMembers, 2);
+    CPSS_PORTS_BMP_PORT_SET_MAC(&portMembers, 3);
+
+    CPSS_PORTS_BMP_PORT_SET_MAC(&tagMembers, 1);
+    CPSS_PORTS_BMP_PORT_SET_MAC(&tagMembers, 2);
+    CPSS_PORTS_BMP_PORT_SET_MAC(&tagMembers, 3);
+
+    GT_STATUS rc = cpssDxChBrgVlanEntryWrite(DEV_NUM, VLAN_ID, &portMembers, &tagMembers);
+    if (rc != GT_OK)
+        printf("❌ VLAN creation failed: %d\n", rc);
+    else
+        printf("✅ VLAN %d created with ports 1,2,3\n", VLAN_ID);
+}
+
+void enableIgmpSnooping()
+{
+    GT_STATUS rc;
+
+    rc = cpssDxChBrgGenIgmpSnoopEnableSet(DEV_NUM, GT_TRUE);
+    if (rc != GT_OK) printf("❌ Global IGMP snooping enable failed: %d\n", rc);
+
+    rc = cpssDxChBrgVlanIgmpSnoopEnableSet(DEV_NUM, VLAN_ID, GT_TRUE);
+    if (rc != GT_OK) printf("❌ VLAN IGMP snooping enable failed: %d\n", rc);
+
+    rc = cpssDxChBrgGenIeeeReservedMcastTrapEnableSet(DEV_NUM, GT_TRUE);
+    if (rc != GT_OK) printf("❌ IGMP Trap to CPU enable failed: %d\n", rc);
+
+    printf("✅ IGMP snooping enabled globally and on VLAN %d\n", VLAN_ID);
+}
+
+void sendIgmpQuery()
+{
+    GT_STATUS rc;
+    CPSS_DXCH_NET_TX_PARAMS_STC txParams;
+    cpssOsMemSet(&txParams, 0, sizeof(txParams));
+
+    txParams.packetIsTagged = GT_TRUE;
+    txParams.dsaParam.dsaType = CPSS_DXCH_NET_DSA_CMD_FROM_CPU_E;
+    txParams.dsaParam.commonParams.vpt = 0;
+    txParams.dsaParam.commonParams.vid = VLAN_ID;
+    txParams.dsaParam.commonParams.cfiBit = 0;
+    txParams.dsaParam.commonParams.dsaTagType = CPSS_DXCH_NET_DSA_2_WORD_TYPE_E;
+    txParams.dsaParam.dsaInfo.fromCpu.dstInterface.type = CPSS_INTERFACE_PORT_E;
+    txParams.dsaParam.dsaInfo.fromCpu.dstInterface.devPort.hwDevNum = DEV_NUM;
+    txParams.dsaParam.dsaInfo.fromCpu.dstInterface.devPort.portNum = TX_PORT;
+    txParams.dsaParam.dsaInfo.fromCpu.tc = 0;
+    txParams.dsaParam.dsaInfo.fromCpu.dp = CPSS_DP_GREEN_E;
+    txParams.dsaParam.dsaInfo.fromCpu.egrFilterEn = GT_FALSE;
+    txParams.dsaParam.dsaInfo.fromCpu.srcDev = DEV_NUM;
+    txParams.dsaParam.dsaInfo.fromCpu.srcIsTrunk = GT_FALSE;
+
+    rc = cpssDxChNetIfSdmaTxPacketSend(DEV_NUM, 0, igmpQueryPacket, sizeof(igmpQueryPacket), &txParams);
+    
+    if (rc == GT_OK)
+        printf("✅ IGMP Query sent on VLAN %d via port %d\n", VLAN_ID, TX_PORT);
+    else
+        printf("❌ Failed to send IGMP Query: %d\n", rc);
+}
+
+void igmpPacketRxHandler
+(
+    IN GT_U8                devNum,
+    IN GT_U8                queueIdx,
+    IN GT_U32               numOfBuff,
+    IN GT_U8                *packetBuffs[],
+    IN GT_U32               buffLen[],
+    IN GT_VOID             *cookie
+)
+{
+    GT_U8 *pkt = packetBuffs[0];
+
+    if (buffLen[0] < 42) return;
+
+    if (pkt[12] == 0x08 && pkt[13] == 0x00) // IPv4
+    {
+        GT_U8 protocol = pkt[23];
+        if (protocol == 0x02)
+        {
+            GT_U8 igmpType = pkt[34];
+            if (igmpType == 0x11)
+                printf("📥 IGMP Query Received\n");
+            else if (igmpType == 0x16 || igmpType == 0x17)
+                printf("📥 IGMPv2 Report Received\n");
+            else if (igmpType == 0x22)
+                printf("📥 IGMPv3 Report Received\n");
+        }
+    }
+}
+
+void registerIgmpRxHandler()
+{
+    GT_STATUS rc;
+    rc = cpssDxChNetIfRxPktReceiveCbRegister(DEV_NUM, 3, igmpPacketRxHandler, NULL);
+    if (rc != GT_OK)
+        printf("❌ Rx Callback Register failed: %d\n", rc);
+    else
+        printf("✅ IGMP Rx Handler registered on queue 3\n");
+}
+
+void monitorDynamicMulticastFdb()
+{
+    GT_STATUS rc;
+    GT_BOOL valid, skip, aged;
+    CPSS_MAC_ENTRY_EXT_STC entry;
+    GT_U32 index;
+
+    printf("\n📡 Scanning FDB for IGMP Multicast Groups:\n");
+
+    for (index = 0; index < 0x1000; ++index)
+    {
+        rc = cpssDxChBrgFdbMacEntryRead(DEV_NUM, index, &valid, &skip, &aged, &entry);
+        if (rc != GT_OK || !valid || skip)
+            continue;
+
+        if (entry.key.entryType == CPSS_MAC_ENTRY_EXT_TYPE_MAC_ADDR &&
+            (entry.key.key.macVlan.macAddr.arEther[0] & 0x01) &&
+            entry.key.key.macVlan.vlanId == VLAN_ID)
+        {
+            printf("🎯 Entry[%04u]: MAC %02X:%02X:%02X:%02X:%02X:%02X, VLAN %d\n",
+                   index,
+                   entry.key.key.macVlan.macAddr.arEther[0],
+                   entry.key.key.macVlan.macAddr.arEther[1],
+                   entry.key.key.macVlan.macAddr.arEther[2],
+                   entry.key.key.macVlan.macAddr.arEther[3],
+                   entry.key.key.macVlan.macAddr.arEther[4],
+                   entry.key.key.macVlan.macAddr.arEther[5],
+                   VLAN_ID);
+        }
+    }
+}
+
+int main()
+{
+    cpssDxChInitializeSystem(DEV_NUM); // assumed API to initialize device & drivers
+
+    createVlanWithPorts();
+    enableIgmpSnooping();
+    registerIgmpRxHandler();
+
+    printf("⏳ Waiting for IGMP Reports...\n");
+
+    for (int i = 0; i < 3; ++i)
+    {
+        sendIgmpQuery();
+        cpssOsTimerWkAfter(10000);  // wait 10 seconds
+        monitorDynamicMulticastFdb();
+    }
+
+    return 0;
+}
