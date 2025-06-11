@@ -1,0 +1,53 @@
+void monitorDynamicMulticastFdb()
+{
+    GT_STATUS rc;
+    GT_BOOL valid, skip, aged;
+    CPSS_MAC_ENTRY_EXT_STC entry;
+    GT_U32 index;
+
+    printf("\n📡 Scanning FDB for IGMP Multicast Groups:\n");
+
+    for (index = 0; index < 0x1000; ++index)
+    {
+        rc = cpssDxChBrgFdbMacEntryRead(DEV_NUM, index, &valid, &skip, &aged, &entry);
+        if (rc != GT_OK || !valid || skip)
+            continue;
+
+        if (entry.key.entryType == CPSS_MAC_ENTRY_EXT_TYPE_MAC_ADDR &&
+            (entry.key.key.macVlan.macAddr.arEther[0] & 0x01) &&  // multicast MAC
+            entry.key.key.macVlan.vlanId == VLAN_ID)
+        {
+            printf("📦 Entry[%04u]: MAC %02X:%02X:%02X:%02X:%02X:%02X, VLAN %d, ",
+                   index,
+                   entry.key.key.macVlan.macAddr.arEther[0],
+                   entry.key.key.macVlan.macAddr.arEther[1],
+                   entry.key.key.macVlan.macAddr.arEther[2],
+                   entry.key.key.macVlan.macAddr.arEther[3],
+                   entry.key.key.macVlan.macAddr.arEther[4],
+                   entry.key.key.macVlan.macAddr.arEther[5],
+                   VLAN_ID);
+
+            if (entry.dstInterface.type == CPSS_INTERFACE_VIDX_E)
+            {
+                CPSS_PORTS_BMP_STC portsBmp;
+                rc = cpssDxChBrgMcEntryRead(DEV_NUM, entry.dstInterface.vidx, &portsBmp);
+                if (rc == GT_OK)
+                {
+                    printf("Ports: ");
+                    for (GT_U32 port = 0; port < 64; ++port)
+                    {
+                        if (CPSS_PORTS_BMP_IS_PORT_SET_MAC(&portsBmp, port))
+                            printf("%u ", port);
+                    }
+                    printf("\n");
+                }
+            }
+        }
+    }
+}
+for (int i = 0; i < 3; ++i)
+{
+    sendIgmpQuery();
+    cpssOsTimerWkAfter(10000);  // wait 10s
+    monitorDynamicMulticastFdb();
+}
